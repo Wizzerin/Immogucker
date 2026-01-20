@@ -1,0 +1,10 @@
+aiogram
+curl_cffi
+sqlalchemy
+psycopg2-binary
+pydantic-settings
+python-dotenv
+beautifulsoup4
+lxml
+undetected-chromedriver
+requests

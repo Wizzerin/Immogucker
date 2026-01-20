@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  # Наш Бот
+  bot:
+    build: .
+    container_name: immogucker_bot
+    restart: always  # Если упадет - сам поднимется
+    shm_size: '2gb'
+    depends_on:
+      - db
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs  # Чтобы логи сохранялись на сервере
+
+  # База данных PostgreSQL
+  db:
+    image: postgres:15-alpine
+    container_name: immogucker_db
+    restart: always
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: immodb
+    volumes:
+      - postgres_data:/var/lib/postgresql/data # Чтобы данные не исчезли при перезагрузке
+    ports:
+      - "5432:5432"
+
+volumes:
+  postgres_data:
