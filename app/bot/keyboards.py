@@ -1,43 +1,58 @@
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
-from app.bot.callbacks import FavCallback
-# --- Тексты кнопок (Konstanten) ---
-BTN_SEARCH = "🔍 Suche einrichten"  # Настроить поиск
-BTN_PROFILE = "👤 Mein Profil"       # Мой профиль
-BTN_FAVORITES = "⭐ Favoriten"
-BTN_HELP = "ℹ️ Hilfe"                # Помощь
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from app.models.settings import Settings
 
-def get_main_keyboard():
-    kb = [
-        # Первый ряд: Поиск и Избранное
-        [KeyboardButton(text=BTN_SEARCH), KeyboardButton(text=BTN_FAVORITES)],
-        # Второй ряд: Профиль и Помощь
-        [KeyboardButton(text=BTN_PROFILE), KeyboardButton(text=BTN_HELP)]
+
+def get_listing_keyboard(link: str, flat_id: int) -> InlineKeyboardMarkup:
+    """Кнопки под объявлением"""
+    fid = str(flat_id)
+    buttons = [
+        [
+            InlineKeyboardButton(text="⭐ Merken", callback_data=f"like_{fid}"),
+            InlineKeyboardButton(text="🗑 Löschen", callback_data=f"dislike_{fid}")
+        ],
+        [
+            InlineKeyboardButton(text="🔗 Angebot öffnen", url=link)
+        ]
     ]
-    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-# Клавиатура под сообщением с квартирой
-def get_listing_keyboard(link: str, flat_id: int):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🌐 Öffnen", url=link),
-            # Кнопка с колбеком: action="add", id=flat_id
-            InlineKeyboardButton(
-                text="❤️ Merken",
-                callback_data=FavCallback(action="add", id=flat_id).pack()
-            )
-        ]
-    ])
-    return kb
 
-# Клавиатура для списка избранного (Кнопка удалить)
-def get_fav_keyboard(flat_id: int, link: str):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+def get_main_keyboard() -> ReplyKeyboardMarkup:
+    """Главное меню"""
+    buttons = [
         [
-            InlineKeyboardButton(text="🌐 Öffnen", url=link),
-            InlineKeyboardButton(
-                text="🗑 Löschen",
-                callback_data=FavCallback(action="del", id=flat_id).pack()
-            )
+            KeyboardButton(text="🔍 Suche einrichten"),
+            KeyboardButton(text="⭐ Favoriten")
+        ],
+        [
+            KeyboardButton(text="👤 Mein Profil"),
+            KeyboardButton(text="ℹ️ Hilfe")
         ]
-    ])
-    return kb
+    ]
+    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+
+
+def get_profile_keyboard(settings: Settings) -> InlineKeyboardMarkup:
+    """Кнопки управления в профиле"""
+    buttons = []
+
+    # WG-Gesucht
+    if settings.wg_url:
+        buttons.append([InlineKeyboardButton(text="🗑 WG-Gesucht löschen", callback_data="del_wg")])
+
+    # ImmoScout24
+    if settings.immo_url:
+        buttons.append([InlineKeyboardButton(text="🗑 ImmoScout24 löschen", callback_data="del_immo")])
+
+    # Immowelt
+    if settings.immowelt_url:
+        buttons.append([InlineKeyboardButton(text="🗑 Immowelt löschen", callback_data="del_iw")])
+
+    # Kleinanzeigen
+    if settings.kleinanzeigen_url:
+        buttons.append([InlineKeyboardButton(text="🗑 Kleinanzeigen löschen", callback_data="del_ka")])
+
+    # Кнопка закрыть
+    buttons.append([InlineKeyboardButton(text="❌ Schließen", callback_data="close_profile")])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)

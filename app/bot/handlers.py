@@ -1,228 +1,295 @@
-from aiogram import Router, F
+import os
+import datetime
+from aiogram import Router, F, types
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery
-from aiogram.fsm.context import FSMContext
-import asyncio
-from app.bot.callbacks import FavCallback
-from app.bot.keyboards import get_listing_keyboard, get_fav_keyboard, BTN_FAVORITES, get_main_keyboard, BTN_SEARCH, \
-    BTN_PROFILE, BTN_HELP
-from app.bot.states import UserState
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from app.core.database import SessionLocal
 from app.models.settings import Settings
 from app.models.favorites import Favorite
 from app.models.immobilien import Immobilie
-from app.providers.wg_gesucht import WGGesuchtProvider
-from app.providers.immoscout import ImmoscoutProvider
-from sqlalchemy import func
+from app.core.service import ImmoService
+from app.bot.keyboards import get_listing_keyboard, get_main_keyboard, get_profile_keyboard
 
 router = Router()
 
 
-# --- 1. START ---
+def get_or_create_settings(session, user_id):
+    settings = session.query(Settings).filter(Settings.user_id == user_id).first()
+    if not settings:
+        settings = Settings(user_id=user_id)
+        session.add(settings)
+        session.commit()
+    return settings
+
+
+# === КОМАНДА /START ===
 @router.message(Command("start"))
-async def cmd_start(message: Message):
+async def cmd_start(message: types.Message):
     await message.answer(
-        f"🇩🇪 <b>Willkommen bei ImmoGucker!</b>\n\n"
-        f"Ich helfe dir, die perfekte Wohnung zu finden.\n"
-        f"Nutze das Menü unten, um zu beginnen.",
-        parse_mode="HTML",
+        "👋 Hallo! Ich bin ImmoGucker.\n"
+        "Nutze das Menü unten, um mich zu steuern.",
         reply_markup=get_main_keyboard()
     )
 
 
-# --- 2. SUCHE EINRICHTEN ---
-@router.message(F.text == BTN_SEARCH)
-async def cmd_setup_search(message: Message, state: FSMContext):
+# === КНОПКА: SUCHE EINRICHTEN (Исправлено) ===
+@router.message(F.text == "🔍 Suche einrichten")
+async def btn_search(message: types.Message):
     await message.answer(
-        "⚙️ <b>Suchauftrag konfigurieren</b>\n\n"
-        "Bitte sende mir jetzt den <b>Link</b> von WG-Gesucht.\n"
-        "1. Gehe auf wg-gesucht.de\n"
-        "2. Wähle Stadt und Filter\n"
-        "3. Kopiere den Link und sende ihn mir hier.",
-        parse_mode="HTML"
-    )
-    await state.set_state(UserState.waiting_for_link)
-
-
-# --- 3. PROFIL (ИСПРАВЛЕНО) ---
-@router.message(F.text == BTN_PROFILE)
-async def cmd_profile(message: Message):
-    user_id = message.from_user.id  # ID того, кто нажал кнопку
-    db = SessionLocal()
-
-    # --- ИСПРАВЛЕНИЕ: Ищем настройки ИМЕННО ЭТОГО пользователя ---
-    settings = db.query(Settings).filter(Settings.user_id == user_id).first()
-    db.close()
-
-    if settings and settings.search_url:
-        await message.answer(
-            f"👤 <b>Dein Profil</b>\n\n"
-            f"🆔 <b>User ID:</b> {user_id}\n"
-            f"✅ <b>Status:</b> Aktiv\n"
-            f"🔗 <b>Aktueller Link:</b>\n{settings.search_url}",
-            parse_mode="HTML"
-        )
-    else:
-        await message.answer(
-            "👤 <b>Dein Profil</b>\n\n"
-            "❌ Du hast noch keine Suche eingerichtet.",
-            parse_mode="HTML"
-        )
-
-
-# --- 4. HILFE ---
-@router.message(F.text == BTN_HELP)
-async def cmd_help(message: Message):
-    await message.answer(
-        "ℹ️ <b>Hilfe & FAQ</b>\n\n"
-        "Ich prüfe alle 60 Sekunden, ob es neue Wohnungen gibt.\n"
-        "Jeder Benutzer hat seine eigenen Einstellungen.",
-        parse_mode="HTML"
+        "Sende mir jetzt einen Link von:\n"
+        "🔸 **WG-Gesucht**\n"
+        "🔹 **ImmoScout24**\n"
+        "🟡 **Immowelt**\n"
+        "🟢 **Kleinanzeigen**"
     )
 
 
-# --- 5. ОБРАБОТКА ССЫЛКИ (ИСПРАВЛЕНО) ---
-@router.message(UserState.waiting_for_link)
-async def process_link(message: Message, state: FSMContext):
-    link = message.text.strip()
-    user_id = message.from_user.id  # ID отправителя
-
-    if "wg-gesucht.de" not in link and "scout24" not in link:
-        await message.answer("⚠️ Das ist kein gültiger WG-Gesucht oder ImmoScout Link.")
-        return
-
-    # Сохраняем в БД
+# === КНОПКА: MEIN PROFIL ===
+@router.message(F.text == "👤 Mein Profil")
+@router.message(Command("profile"))
+async def btn_profile(message: types.Message):
     db = SessionLocal()
-
-    # --- ИСПРАВЛЕНИЕ: Ищем запись ЭТОГО юзера ---
-    settings = db.query(Settings).filter(Settings.user_id == user_id).first()
-
-    if not settings:
-        # Если записи нет - создаем новую
-        settings = Settings(search_url=link, user_id=user_id)
-        db.add(settings)
-        print(f"🆕 Neue User-Settings erstellt für ID {user_id}")
-    else:
-        # Если есть - обновляем ЕГО запись
-        settings.search_url = link
-        print(f"🔄 User-Settings aktualisiert für ID {user_id}")
-
-    db.commit()
-    db.close()
-
-    await message.answer("✅ <b>Link gespeichert!</b> Ich teste die Verbindung...", parse_mode="HTML")
-
-    # Тест
     try:
-        provider = None
-        if "scout24" in link:
-            provider = ImmoscoutProvider()  # Nimm den Browser für Scout24
+        settings = get_or_create_settings(db, message.from_user.id)
+
+        # Проверяем, не истек ли премиум
+        if settings.is_premium and settings.premium_until:
+            if settings.premium_until < datetime.date.today():
+                settings.is_premium = False
+                settings.premium_until = None
+                db.commit()
+
+        # Формируем статус
+        if settings.is_premium:
+            status = f"🌟 <b>PREMIUM</b> (bis {settings.premium_until})"
         else:
-            provider = WGGesuchtProvider()  # Nimm Requests für WG-Gesucht
+            status = "🆓 <b>Kostenlos</b> (Max. 1 Suche)"
 
-        items = await provider.fetch_listings(url=link)
-        count = len(items)
-
-        await message.answer(
-            f"🎉 <b>Erfolg!</b>\n"
-            f"Ich sehe aktuell <b>{count} Angebote</b> für deinen Link.\n"
-            f"Suche ist aktiv!",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard()
-        )
-    except Exception as e:
-        await message.answer(f"⚠️ Fehler beim Testen: {e}")
-        # Logge den Fehler für dich als Admin
-        print(f"❌ Test-Fehler: {e}")
-
-    await state.clear()
-
-
-# --- 1. ПОКАЗАТЬ ИЗБРАННОЕ ---
-@router.message(F.text == BTN_FAVORITES)
-async def cmd_show_favorites(message: Message):
-    user_id = message.from_user.id
-    db = SessionLocal()
-
-    # Получаем все избранные пользователя
-    favs = db.query(Favorite).filter(Favorite.user_id == user_id).all()
-
-    if not favs:
-        await message.answer("⭐️ <b>Deine Favoritenliste ist leer.</b>", parse_mode="HTML")
-        db.close()
-        return
-
-    await message.answer(f"⭐️ <b>Du hast {len(favs)} Wohnungen gespeichert:</b>", parse_mode="HTML")
-
-    for fav in favs:
-        # Для каждой избранной записи подгружаем данные квартиры
-        flat = fav.immobilie
-
-        # Считаем, сколько людей ВСЕГО лайкнули эту квартиру (популярность)
-        count_likes = db.query(func.count(Favorite.id)).filter(Favorite.immobilie_id == flat.id).scalar()
+        wg_state = "✅" if settings.wg_url else "❌"
+        immo_state = "✅" if settings.immo_url else "❌"
+        iw_state = "✅" if settings.immowelt_url else "❌"
+        ka_state = "✅" if settings.kleinanzeigen_url else "❌"
 
         text = (
-            f"🏠 <b>{flat.titel}</b>\n"
-            f"💶 {flat.kaltmiete} € | 📏 {flat.flaeche} m²\n"
-            f"🔥 <i>Interessenten: {count_likes}</i>"  # <--- Показываем интерес
+            f"📋 <b>Dein Suchprofil</b>\n"
+            f"Status: {status}\n\n"
+            f"🔸 WG-Gesucht: {wg_state}\n"
+            f"🔹 ImmoScout24: {immo_state}\n"
+            f"🟡 Immowelt: {iw_state}\n"
+            f"🟢 Kleinanzeigen: {ka_state}\n\n"
+            f"🔗 {settings.wg_url or settings.immo_url or settings.immowelt_url or settings.kleinanzeigen_url or 'Keine Links'}\n\n"
+            f"<i>Sende einen neuen Link zum Hinzufügen/Ändern.</i>"
         )
 
-        await message.answer(
-            text,
-            reply_markup=get_fav_keyboard(flat_id=flat.id, link=flat.link),
-            parse_mode="HTML"
+        kb = get_profile_keyboard(settings)
+        await message.answer(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+    finally:
+        db.close()
+
+
+# === КНОПКА: FAVORITEN ===
+@router.message(F.text == "⭐ Favoriten")
+async def btn_favorites(message: types.Message):
+    db = SessionLocal()
+    try:
+        favs = db.query(Immobilie).join(Favorite, Favorite.immobilie_id == Immobilie.id) \
+            .filter(Favorite.user_id == message.from_user.id).all()
+
+        if not favs:
+            await message.answer("📭 Deine Favoritenliste ist leer.")
+            return
+
+        await message.answer(f"⭐ **Gespeicherte Wohnungen ({len(favs)}):**")
+
+        for flat in favs:
+            text = (
+                f"🏠 <b>{flat.titel}</b>\n"
+                f"💶 {flat.kaltmiete} € | 📏 {flat.flaeche} m²\n"
+                f"<a href='{flat.link}'>Link öffnen</a>"
+            )
+            kb = get_listing_keyboard(flat.link, flat.id)
+            await message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+    except Exception as e:
+        await message.answer(f"❌ Fehler: {e}")
+    finally:
+        db.close()
+
+
+# === КНОПКА: HILFE (Исправлено) ===
+@router.message(F.text == "ℹ️ Hilfe")
+async def btn_help(message: types.Message):
+    await message.answer(
+        "ℹ️ **Hilfe**\n\n"
+        "1. Klicke auf **'Suche einrichten'**.\n"
+        "2. Sende einen Link von:\n"
+        "   • ImmoScout24\n"
+        "   • WG-Gesucht\n"
+        "   • Immowelt\n"
+        "   • Kleinanzeigen\n"
+        "3. Ich suche automatisch alle 5-10 Minuten nach neuen Angeboten.\n\n"
+        "Wenn du ein Angebot **merkst** (⭐), landet es in deinen **Favoriten**."
+    )
+
+
+# === АДМИНКА ===
+@router.message(Command("admin"))
+async def cmd_admin(message: types.Message):
+    admin_id = os.getenv("ADMIN_ID")
+    if str(message.from_user.id) != str(admin_id):
+        return
+
+    db = SessionLocal()
+    try:
+        total_users = db.query(Settings).count()
+        active_users = db.query(Settings).filter(Settings.is_active == True).count()
+
+        wg_count = db.query(Settings).filter(Settings.wg_url != None).count()
+        immo_count = db.query(Settings).filter(Settings.immo_url != None).count()
+        iw_count = db.query(Settings).filter(Settings.immowelt_url != None).count()
+        ka_count = db.query(Settings).filter(Settings.kleinanzeigen_url != None).count()
+
+        total_tasks = wg_count + immo_count + iw_count + ka_count
+
+        text = (
+            f"👑 <b>Admin-Panel</b>\n\n"
+            f"👥 <b>Nutzer:</b> {total_users} (Aktiv: {active_users})\n"
+            f"🔄 <b>Aktive Suchaufträge:</b> {total_tasks}\n\n"
+            f"🔸 WG-Gesucht: {wg_count}\n"
+            f"🔹 ImmoScout24: {immo_count}\n"
+            f"🟡 Immowelt: {iw_count}\n"
+            f"🟢 Kleinanzeigen: {ka_count}\n"
         )
-        # Небольшая задержка, чтобы не зафлудить
-        await asyncio.sleep(0.3)
 
-    db.close()
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📢 Рассылка (Coming soon)", callback_data="admin_broadcast")]
+        ])
+
+        await message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+    except Exception as e:
+        await message.answer(f"Error: {e}")
+    finally:
+        db.close()
 
 
-# --- 2. ДОБАВИТЬ В ИЗБРАННОЕ (Нажатие на ❤️) ---
-@router.callback_query(FavCallback.filter(F.action == "add"))
-async def cb_add_fav(callback: CallbackQuery, callback_data: FavCallback):
-    flat_id = callback_data.id
-    user_id = callback.from_user.id
-
+# === СОХРАНЕНИЕ ССЫЛКИ ===
+@router.message(F.text.contains("http"))
+async def save_url(message: types.Message):
+    url = message.text.strip()
     db = SessionLocal()
 
-    # Проверяем, не добавлено ли уже
-    exists = db.query(Favorite).filter(
-        Favorite.user_id == user_id,
-        Favorite.immobilie_id == flat_id
-    ).first()
+    try:
+        settings = get_or_create_settings(db, message.from_user.id)
 
-    if exists:
-        await callback.answer("⚠️ Bereits in Favoriten! (Уже в избранном)", show_alert=True)
-    else:
-        new_fav = Favorite(user_id=user_id, immobilie_id=flat_id)
-        db.add(new_fav)
+        # === ПРОВЕРКА PREMIUM ===
+        # Считаем, сколько ссылок уже есть
+        active_links = 0
+        if settings.wg_url: active_links += 1
+        if settings.immo_url: active_links += 1
+        if settings.immowelt_url: active_links += 1
+        if settings.kleinanzeigen_url: active_links += 1
+
+        # Определяем тип новой ссылки
+        new_type = None
+        if "wg-gesucht.de" in url:
+            new_type = "wg"
+        elif "immobilienscout24.de" in url:
+            new_type = "immo"
+        elif "immowelt.de" in url:
+            new_type = "iw"
+        elif "kleinanzeigen.de" in url:
+            new_type = "ka"
+        else:
+            await message.answer("⚠️ Unbekannter Link.")
+            return
+
+        # Если юзер НЕ премиум
+        if not settings.is_premium:
+            # Если у него уже есть ссылка, и он пытается добавить ДРУГОЙ тип -> Блок
+            # (Если он обновляет уже существующую ссылку того же типа - разрешаем)
+            is_update = False
+            if new_type == "wg" and settings.wg_url: is_update = True
+            if new_type == "immo" and settings.immo_url: is_update = True
+            if new_type == "iw" and settings.immowelt_url: is_update = True
+            if new_type == "ka" and settings.kleinanzeigen_url: is_update = True
+
+            if active_links >= 1 and not is_update:
+                await message.answer(
+                    "🚫 <b>Limit erreicht!</b>\n\n"
+                    "Als Free-User kannst du nur <b>eine</b> Suche gleichzeitig aktiv haben.\n"
+                    "Bitte lösche erst die alte Suche im Profil oder upgrade auf Premium.",
+                    parse_mode="HTML"
+                )
+                return
+
+        # Сохранение (как и раньше)
+        saved_type = ""
+        if new_type == "wg":
+            settings.wg_url = url
+            saved_type = "WG-Gesucht"
+        elif new_type == "immo":
+            settings.immo_url = url
+            saved_type = "ImmoScout24"
+        elif new_type == "iw":
+            settings.immowelt_url = url
+            saved_type = "Immowelt"
+        elif new_type == "ka":
+            settings.kleinanzeigen_url = url
+            saved_type = "Kleinanzeigen"
+
         db.commit()
-        await callback.answer("✅ Gespeichert! (Сохранено)")
+        await message.answer(f"✅ <b>{saved_type}</b> Link gespeichert!\n🔎 Suche läuft...", parse_mode="HTML")
 
-    db.close()
+        # Запуск поиска (тот же код)
+        service = ImmoService(db)
+        new_flats = await service.process_user(message.from_user.id, url)
+        # ... (код вывода объявлений оставь как был) ...
+
+    except Exception as e:
+        await message.answer(f"❌ Fehler: {e}")
+    finally:
+        db.close()
 
 
-# --- 3. УДАЛИТЬ ИЗ ИЗБРАННОГО (Нажатие на 🗑) ---
-@router.callback_query(FavCallback.filter(F.action == "del"))
-async def cb_del_fav(callback: CallbackQuery, callback_data: FavCallback):
-    flat_id = callback_data.id
-    user_id = callback.from_user.id
+@router.message(Command("promo"))
+async def cmd_promo(message: types.Message):
+    # Проверка админа
+    admin_id = os.getenv("ADMIN_ID")
+    if str(message.from_user.id) != str(admin_id):
+        return
 
-    db = SessionLocal()
+    try:
+        # Парсим аргументы: /promo 12345 30
+        args = message.text.split()
+        if len(args) != 3:
+            await message.answer("⚠️ Format: /promo <user_id> <days>")
+            return
 
-    fav = db.query(Favorite).filter(
-        Favorite.user_id == user_id,
-        Favorite.immobilie_id == flat_id
-    ).first()
+        target_id = int(args[1])
+        days = int(args[2])
 
-    if fav:
-        db.delete(fav)
+        db = SessionLocal()
+        settings = db.query(Settings).filter(Settings.user_id == target_id).first()
+
+        if not settings:
+            # Если юзера нет в базе, создаем
+            settings = Settings(user_id=target_id)
+            db.add(settings)
+
+        # Выдаем премиум
+        settings.is_premium = True
+        settings.premium_until = datetime.date.today() + datetime.timedelta(days=days)
         db.commit()
-        await callback.answer("🗑 Gelöscht! (Удалено)")
-        # Удаляем сообщение из чата визуально
-        await callback.message.delete()
-    else:
-        await callback.answer("❌ Fehler: Nicht gefunden.")
 
-    db.close()
+        await message.answer(f"✅ Premium für User {target_id} aktiviert ({days} Tage).")
+
+        # Опционально: уведомить юзера
+        try:
+            await message.bot.send_message(target_id, f"🌟 <b>Glückwunsch!</b>\nDu hast {days} Tage Premium erhalten!")
+        except:
+            pass
+
+        db.close()
+    except Exception as e:
+        await message.answer(f"Error: {e}")
