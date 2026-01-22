@@ -10,8 +10,8 @@ class BrowserManager:
     def __init__(self):
         self.driver = None
         self.last_restart = 0
-        self.restart_interval = 1800  # 30 минут в секундах
-        self.lock = asyncio.Lock()  # Глобальный замок
+        self.restart_interval = 1800  # 30 минут
+        self.lock = asyncio.Lock()
 
     def _start_driver(self):
         """Запускает новый экземпляр Chrome"""
@@ -20,10 +20,15 @@ class BrowserManager:
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--start-maximized")
-        # Отключаем картинки для скорости
         options.add_argument('--blink-settings=imagesEnabled=false')
 
+        # [NEW] Стратегия EAGER: не ждать полной загрузки (картинок/стилей/рекламы)
+        # Selenium вернет управление сразу, как только будет готов HTML.
+        options.page_load_strategy = 'eager'
+
         self.driver = uc.Chrome(options=options, version_main=None)
+
+        # Тайм-аут на загрузку страницы (если за 60 сек HTML не пришел - ошибка)
         self.driver.set_page_load_timeout(60)
         self.last_restart = time.time()
 
@@ -31,23 +36,31 @@ class BrowserManager:
         """Возвращает активный драйвер, перезапускает если нужно"""
         current_time = time.time()
 
-        # Если драйвера нет или прошло 30 минут -> перезапуск
         if self.driver is None or (current_time - self.last_restart > self.restart_interval):
             if self.driver:
-                logger.info("⏰ Время жизни браузера истекло (30 мин). Перезапуск...")
+                logger.info("⏰ Плановый перезапуск браузера (30 мин)...")
                 try:
                     self.driver.quit()
                 except:
                     pass
 
-            # Запускаем в отдельном потоке, чтобы не блокировать бота
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, self._start_driver)
 
         return self.driver
 
+    async def force_restart(self):
+        """Экстренный сброс драйвера при ошибках"""
+        logger.warning("🧨 Драйвер сломался! Сбрасываю состояние...")
+        if self.driver:
+            try:
+                self.driver.quit()
+            except:
+                pass
+        self.driver = None
+
     async def close(self):
-        """Закрывает браузер при выключении бота"""
+        """Закрывает браузер при выключении"""
         if self.driver:
             logger.info("🛑 Закрываю браузер...")
             try:
@@ -57,5 +70,4 @@ class BrowserManager:
             self.driver = None
 
 
-# Создаем глобальный экземпляр
 browser_manager = BrowserManager()

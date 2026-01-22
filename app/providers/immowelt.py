@@ -1,9 +1,10 @@
 import asyncio
 import logging
-import re
+import os
 from typing import List, Dict, Any
 from bs4 import BeautifulSoup
 from app.providers.base import BaseProvider
+from app.core.browser import browser_manager
 
 logger = logging.getLogger(__name__)
 
@@ -11,7 +12,6 @@ logger = logging.getLogger(__name__)
 class ImmoweltProvider(BaseProvider):
     async def fetch_listings(self, url: str, driver: Any = None) -> List[Dict]:
         if not driver:
-            logger.error("❌ Immowelt требует драйвер!")
             return []
 
         logger.info(f"🤖 [Immowelt] Работаю в открытом окне...")
@@ -26,55 +26,119 @@ class ImmoweltProvider(BaseProvider):
 
             await loop.run_in_executor(None, interact)
 
-            logger.info("⏳ Жду 5 сек...")
-            await asyncio.sleep(5)
+            # Ждем чуть дольше, чтобы React успел отрисовать карточки
+            logger.info("⏳ Жду 6 сек (рендеринг)...")
+            await asyncio.sleep(6)
 
-            driver.execute_script("window.scrollTo(0, 700);")
+            # === АГРЕССИВНОЕ ЗАКРЫТИЕ КУКИ ===
+            try:
+                driver.execute_script("""
+                try {
+                    let host = document.querySelector('#usercentrics-root');
+                    if (host && host.shadowRoot) {
+                        let btn = host.shadowRoot.querySelector('button[data-testid="uc-accept-all-button"]');
+                        if (btn) btn.click();
+                    }
+                } catch(e) {}
+
+                // Разблокировка прокрутки
+                document.body.style.overflow = 'auto';
+                document.documentElement.style.overflow = 'auto';
+                """)
+            except:
+                pass
+
+            # === СКРОЛЛ (Обязательно для подгрузки картинок и цен) ===
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight / 3);")
+            await asyncio.sleep(1)
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight / 1.5);")
+            await asyncio.sleep(1)
+            driver.execute_script("window.scrollTo(0, 0);")  # Вернуться наверх (иногда помогает)
             await asyncio.sleep(1)
 
             html = driver.page_source
             soup = BeautifulSoup(html, 'lxml')
 
-            cards = soup.find_all("div", attrs={"data-testid": "serp-core-classified-card-testid"})
-            logger.info(f"🔎 Immowelt: Найдено {len(cards)} карточек")
+            # === [NEW] НОВЫЕ СЕЛЕКТОРЫ (из твоего snapshot.html) ===
 
-            for i, card in enumerate(cards):
+            # Ищем контейнеры по новому data-testid
+            items = soup.find_all("div", attrs={"data-testid": "serp-core-classified-card-testid"})
+
+            # Если вдруг не нашло, пробуем запасной вариант (по ID)
+            if not items:
+                items = soup.find_all("div", id=lambda x: x and x.startswith("classified-card-"))
+
+            logger.info(f"🔎 Immowelt: Найдено {len(items)} карточек")
+
+            # Если снова 0 - сохраняем дебаг, чтобы проверить, не забанили ли нас
+            if len(items) == 0:
+                with open("immowelt_debug_v2.html", "w", encoding="utf-8") as f:
+                    f.write(html)
+
+            for item in items:
                 try:
-                    link_tag = card.find("a", attrs={"data-testid": "card-mfe-covering-link-testid"})
+                    # 1. Ссылка и заголовок теперь в одном <a>
+                    link_tag = item.find("a", attrs={"data-testid": "card-mfe-covering-link-testid"})
+                    if not link_tag:
+                        # Fallback: ищем любую ссылку внутри
+                        link_tag = item.find("a", href=True)
+
                     if not link_tag: continue
-                    link = link_tag['href']
 
-                    if "tausch" in card.text.lower() or "swap" in card.text.lower():
-                        continue
+                    href = link_tag.get('href')
+                    if not href.startswith("http"):
+                        link = f"https://www.immowelt.de{href}"
+                    else:
+                        link = href
 
-                    title = link_tag.get("title", "Wohnung").replace("Wohnung zur Miete", "").strip() or "Wohnung"
+                    # Заголовок часто в атрибуте title самой ссылки или внутри h2
+                    title = link_tag.get("title")
+                    if not title:
+                        h2 = item.find("h2")
+                        title = h2.text.strip() if h2 else "Wohnung"
 
-                    price_div = card.find("div", attrs={"data-testid": "cardmfe-price-testid"})
-                    price = "0"
+                    # 2. Цена
+                    price = "Anfrage"
+                    price_div = item.find("div", attrs={"data-testid": "cardmfe-price-testid"})
                     if price_div:
-                        cl_price = re.search(r'[\d\.]+', price_div.text)
-                        if cl_price: price = cl_price.group(0).replace(".", "")
+                        # Там обычно вложенный div с ценой
+                        price_text = price_div.get_text(strip=True)
+                        # Чистим цену (1.100 € -> 1100)
+                        price = price_text.replace("€", "").replace("Kaltmiete", "").strip()
 
-                    facts_div = card.find("div", attrs={"data-testid": "cardmfe-keyfacts-testid"})
+                    # 3. Площадь (ищем внутри Keyfacts)
                     area = "0"
+                    facts_div = item.find("div", attrs={"data-testid": "cardmfe-keyfacts-testid"})
                     if facts_div:
-                        area_match = re.search(r'(\d+([.,]\d+)?)\s*m²', facts_div.text)
-                        if area_match: area = area_match.group(1).replace(",", ".")
+                        # Текст внутри: "2 Zimmer · 55 m² · 2. Geschoss"
+                        facts_text = facts_div.get_text(" ", strip=True)
+                        parts = facts_text.split("·")
+                        for part in parts:
+                            if "m²" in part or "m2" in part:
+                                area = part.replace("m²", "").replace("m2", "").strip()
+                                break
 
-                    listings.append(
-                        {'titel': title, 'preis': price, 'flaeche': area, 'link': link, 'quelle': 'Immowelt'})
-                except:
+                    listings.append({
+                        'titel': title,
+                        'preis': price,
+                        'flaeche': area,
+                        'link': link,
+                        'quelle': 'Immowelt'
+                    })
+
+                except Exception as e:
+                    # logger.error(f"Ошибка парсинга отдельной карточки: {e}")
                     continue
 
         except Exception as e:
-            logger.error(f"❌ Immowelt Error: {e}")
+            logger.error(f"❌ Immowelt Global Error: {e}")
+            await browser_manager.force_restart()
 
         finally:
-            # === ЧИСТКА СЛЕДОВ ===
+            # Чистим куки, чтобы следующий заход был "как новый"
             try:
                 driver.delete_all_cookies()
                 driver.execute_script("window.localStorage.clear();")
-                logger.info("🧹 Куки Immowelt очищены.")
             except:
                 pass
 

@@ -3,6 +3,8 @@ import logging
 from typing import List, Dict, Any
 from bs4 import BeautifulSoup
 from app.providers.base import BaseProvider
+# [NEW] Импортируем менеджер для рестарта
+from app.core.browser import browser_manager
 
 logger = logging.getLogger(__name__)
 
@@ -13,21 +15,20 @@ class ImmoscoutProvider(BaseProvider):
             logger.error("❌ ImmoScout требует драйвер!")
             return []
 
-        logger.info(f"🤖 [ImmoScout] Работаю в открытом окне...")
+        logger.info(f"🤖 [ImmoScout] Работаю...")
         listings = []
 
         try:
-            # Работаем с драйвером в executor'е, чтобы не блокировать бота
             loop = asyncio.get_event_loop()
 
             def interact():
                 driver.get(url)
                 return driver.page_source
 
-            # Переход по ссылке
+            # Пытаемся открыть страницу
             html = await loop.run_in_executor(None, interact)
 
-            logger.info("⏳ Жду 5 сек (рендеринг)...")
+            # Ожидание рендеринга
             await asyncio.sleep(5)
 
             # === ЗАКРЫТИЕ БАННЕРА ===
@@ -42,20 +43,16 @@ class ImmoscoutProvider(BaseProvider):
             except:
                 pass
 
-            # Скролл
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
             await asyncio.sleep(2)
 
-            # Обновляем HTML после скриптов
             html = driver.page_source
             soup = BeautifulSoup(html, 'lxml')
 
-            # --- Логика парсинга (БЕЗ ИЗМЕНЕНИЙ) ---
-            # 1. Чистка мусора
+            # --- Логика парсинга ---
             for noise in soup.find_all(attrs={"data-testid": "SurroundingSuburbs"}): noise.decompose()
             for noise in soup.find_all("section", class_="surrounding-suburbs"): noise.decompose()
 
-            # 2. Поиск контейнера
             main_list = soup.find("div", id="result-list-content") or soup
             items = main_list.find_all("div", attrs={"data-obid": True})
 
@@ -99,15 +96,16 @@ class ImmoscoutProvider(BaseProvider):
                     continue
 
         except Exception as e:
-            logger.error(f"❌ ImmoScout Error: {e}")
+            logger.error(f"❌ ImmoScout Critical Error: {e}")
+            # [NEW] Если ошибка произошла, скорее всего браузер мертв или забанен.
+            # Сбрасываем его, чтобы следующий запрос открыл чистое окно.
+            await browser_manager.force_restart()
 
         finally:
-            # === ВАЖНО: ЧИСТИМ КУКИ ДЛЯ СЛЕДУЮЩЕГО ЗАПРОСА ===
             try:
                 driver.delete_all_cookies()
                 driver.execute_script("window.localStorage.clear();")
                 driver.execute_script("window.sessionStorage.clear();")
-                logger.info("🧹 Куки ImmoScout очищены.")
             except:
                 pass
 
